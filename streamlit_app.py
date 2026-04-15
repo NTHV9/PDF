@@ -283,7 +283,10 @@ def extract_statement_rows(pdf_bytes):
             if not primary_ys:
                 continue
 
-            # ── Pass 2: assign continuation lines to nearest primary via midpoint rule ──
+            # ── Pass 2: collect continuations with y positions ──
+            # Use defaultdict keyed by nearest_py; each field stores [(y, text), ...]
+            cont = defaultdict(lambda: {'desc': [], 'voucher': []})
+
             for y in sorted(rows_by_y.keys()):
                 if y < 195 or y > 715:
                     continue
@@ -324,15 +327,27 @@ def extract_statement_rows(pdf_bytes):
                 if desc_cont.lower() in HEADER_WORDS or vch_cont.lower() in HEADER_WORDS:
                     continue
 
-                row = primary_data[nearest_py]
                 if desc_cont:
-                    row['desc'] = (row['desc'] + ' ' + desc_cont).strip()
+                    cont[nearest_py]['desc'].append((y, desc_cont))
                 if vch_cont:
-                    row['voucher'] = (row['voucher'] + ' ' + vch_cont).strip()
+                    cont[nearest_py]['voucher'].append((y, vch_cont))
 
-            # Collect rows in top-to-bottom order
-            for y in primary_ys:
-                all_rows.append(primary_data[y])
+            # ── Build final field values in correct y order ──
+            for py in primary_ys:
+                row = primary_data[py]
+
+                # Voucher: sort all fragments (primary + continuations) by y,
+                # then concatenate WITHOUT spaces — long references wrap mid-token
+                vch_all = sorted(cont[py]['voucher'] + [(py, row['voucher'])],
+                                 key=lambda x: x[0])
+                row['voucher'] = ''.join(v for _, v in vch_all if v)
+
+                # Desc: sort by y, join WITH spaces (name/text wraps with natural spaces)
+                desc_all = sorted(cont[py]['desc'] + [(py, row['desc'])],
+                                  key=lambda x: x[0])
+                row['desc'] = ' '.join(d for _, d in desc_all if d)
+
+                all_rows.append(row)
 
     return all_rows
 
