@@ -207,7 +207,7 @@ def _detect_soa_col_bounds(pdf_bytes):
                             return dict(
                                 DATE_MAX      = mid('Date', 'Folio'),
                                 FOLIO_MAX     = mid('Folio', 'Description'),
-                                DESC_MAX      = mid('Description', 'Arrival'),
+                                DESC_MAX      = col['Arrival'] - 5,
                                 ARR_MAX       = mid('Arrival', 'Departure'),
                                 DEP_MAX       = mid('Departure', 'Voucher'),
                                 VCH_MAX       = mid('Voucher', 'Debit'),
