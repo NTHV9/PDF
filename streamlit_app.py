@@ -861,4 +861,4 @@ if uploaded:
                     st.error(f"❌ เกิดข้อผิดพลาด: {e}")
 
 st.divider()
-st.caption("💡 ระบบตรวจจับประเภท PDF อัตโนมัติ — รองรับเฉพาะ searchable PDF (ไม่ใช่ภาพสแก 
+st.caption("💡 ระบบตรวจจับประเภท PDF อัตโนมัติ — รองรับเฉพาะ searchable PDF (ไม่ใช่ภาพสแกน)")
