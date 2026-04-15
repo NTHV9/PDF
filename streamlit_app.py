@@ -511,14 +511,14 @@ def get_print_date(pdf_bytes):
 
 
 # ─── UI ─────────────────────────────────────────────────────────────
-st.markdown("## 📊 PDF → Excel Converter")
+st.markdown("## 📊 PDF → Excel ตัวไหนไม่ได้แจ้งก้องนะครับ")
 st.markdown("รองรับ 2 ประเภท: **งบทดลอง** และ **Statement of Account**")
 st.divider()
 
 uploaded = st.file_uploader(
     "อัปโหลดไฟล์ PDF",
     type=['pdf'],
-    help="รองรับ PDF ที่สร้างจากโปรแกรมบัญชี (ไม่ใช่ภาพสแกน)"
+    help="รองรับ PDF ที่ไม่ใช่ภาพสแกน"
 )
 
 if uploaded:
