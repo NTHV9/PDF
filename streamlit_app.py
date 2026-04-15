@@ -189,7 +189,7 @@ def detect_company_soa(pdf_bytes):
 _SOA_HEADER_COLS = ['Date', 'Folio', 'Description', 'Arrival', 'Departure', 'Voucher', 'Debit', 'Credit', 'Balance']
 
 def _detect_soa_col_bounds(pdf_bytes):
-    """Detect column boundaries dynamically from the header row of the Statement PDF."""
+    """Detect column boundaries dynamically from the header row AND actual data rows."""
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages[:2]:
@@ -197,23 +197,55 @@ def _detect_soa_col_bounds(pdf_bytes):
                 rows_by_y = defaultdict(list)
                 for w in words:
                     rows_by_y[round(w['top'] / 3) * 3].append(w)
+
+                # ── Step 1: find header row to get approximate column x0 positions ──
+                col = None
+                header_y = None
                 for y in sorted(rows_by_y.keys()):
                     row_words = rows_by_y[y]
                     texts = [w['text'] for w in row_words]
                     if 'Departure' in texts and 'Voucher' in texts:
-                        col = {w['text']: w['x0'] for w in row_words if w['text'] in _SOA_HEADER_COLS}
-                        if all(k in col for k in ['Date','Folio','Description','Arrival','Departure','Voucher','Debit']):
-                            def mid(a, b): return (col[a] + col[b]) / 2
-                            return dict(
-                                DATE_MAX      = mid('Date', 'Folio'),
-                                FOLIO_MAX     = mid('Folio', 'Description'),
-                                DESC_MAX      = col['Arrival'] - 5,
-                                ARR_MAX       = mid('Arrival', 'Departure'),
-                                DEP_MAX       = mid('Departure', 'Voucher'),
-                                VCH_MAX       = mid('Voucher', 'Debit'),
-                                DEBIT_X1_MAX  = col.get('Credit', col['Debit'] + 50),
-                                CREDIT_X1_MAX = col.get('Balance', col.get('Credit', col['Debit'] + 80) + 50),
-                            )
+                        c = {w['text']: w['x0'] for w in row_words if w['text'] in _SOA_HEADER_COLS}
+                        if all(k in c for k in ['Date','Folio','Description','Arrival','Departure','Voucher','Debit']):
+                            col = c
+                            header_y = y
+                            break
+
+                if not col:
+                    continue
+
+                def mid(a, b): return (col[a] + col[b]) / 2
+
+                # ── Step 2: scan data rows to find actual Arrival date x0 positions ──
+                # Look for dd/mm/yy values between Description and Departure columns
+                arr_data_x0s = []
+                for y in sorted(rows_by_y.keys()):
+                    if y <= header_y or y > 715:
+                        continue
+                    for w in rows_by_y[y]:
+                        if (re.match(r'^\d{2}/\d{2}/\d{2}$', w['text']) and
+                                col['Description'] < w['x0'] < col['Departure']):
+                            arr_data_x0s.append(w['x0'])
+                    if len(arr_data_x0s) >= 10:
+                        break  # enough samples
+
+                # DESC_MAX = 2px before the leftmost actual arrival date found
+                # This is truly data-driven — adapts to each PDF automatically
+                if arr_data_x0s:
+                    desc_max = min(arr_data_x0s) - 2
+                else:
+                    desc_max = col['Arrival'] - 5  # fallback if no date data found
+
+                return dict(
+                    DATE_MAX      = mid('Date', 'Folio'),
+                    FOLIO_MAX     = mid('Folio', 'Description'),
+                    DESC_MAX      = desc_max,
+                    ARR_MAX       = mid('Arrival', 'Departure'),
+                    DEP_MAX       = mid('Departure', 'Voucher'),
+                    VCH_MAX       = mid('Voucher', 'Debit'),
+                    DEBIT_X1_MAX  = col.get('Credit', col['Debit'] + 50),
+                    CREDIT_X1_MAX = col.get('Balance', col.get('Credit', col['Debit'] + 80) + 50),
+                )
     except:
         pass
     # Fallback (Batch-style layout)
