@@ -166,8 +166,111 @@ def extract_matrix_rows(pdf_bytes):
 
     return all_rows
 
+def _matrix_words_to_vals(words, col_x1s):
+    """Map a row of pdfplumber words → list of 11 floats/None:
+    [net_amt, dep_dr, dep_cr, guest_dr, guest_cr, pkg_dr, pkg_cr, ar_dr, ar_cr, int_db, net_rev]
+    Handles '- 12,345.67' negative sign pairs.
+    """
+    vals = [None] * 11
+    ws = sorted(words, key=lambda w: w['x0'])
+    # Merge "- number" pairs
+    merged = []
+    i = 0
+    while i < len(ws):
+        w = ws[i]
+        if (w['text'] == '-' and i + 1 < len(ws) and
+                ws[i+1]['x0'] - w['x1'] < 5 and
+                re.match(r'^[\d,]+', ws[i+1]['text'])):
+            merged.append({'x0': w['x0'], 'x1': ws[i+1]['x1'],
+                           'text': '-' + ws[i+1]['text']})
+            i += 2
+        else:
+            merged.append(w)
+            i += 1
+    for w in merged:
+        x1, t = w['x1'], w['text']
+        if not re.match(r'^-?[\d,]+\.?\d*$', t):
+            continue
+        v = clean_num(t)
+        if x1 < col_x1s[0] - 30:         # Net Amount
+            vals[0] = v
+        elif x1 > col_x1s[-1] + 5:       # Net Revenue
+            vals[10] = v
+        else:
+            best = min(range(len(col_x1s)), key=lambda ci: abs(x1 - col_x1s[ci]))
+            if abs(x1 - col_x1s[best]) < 35:
+                vals[best + 1] = v        # offset: vals[0]=net_amt, vals[1]=dep_dr, …
+    return vals
+
+def _extract_matrix_special(pdf_bytes):
+    """Extract Balance-From, Running-Totals-BF, PDF-Total, Running-Totals-CF,
+    and Final-Balance rows.  Returns a dict with keys:
+      bf_date, bf_vals, rt_bf_vals, total_vals, rt_cf_vals, fb_vals
+    Each *_vals is a list of 11 floats/None.
+    """
+    out = {}
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            # ── Get col_x1s from first page ──
+            page0 = pdf.pages[0]
+            rby0 = defaultdict(list)
+            for w in page0.extract_words():
+                rby0[round(w['top'] / 2) * 2].append(w)
+            col_x1s = None
+            for y in sorted(rby0.keys()):
+                rw = rby0[y]
+                dc = sum(1 for w in rw if w['text'] in ('Debit', 'Credit'))
+                if dc >= 3:
+                    col_x1s = sorted(w['x1'] for w in rw if w['text'] in ('Debit', 'Credit'))
+                    break
+            if not col_x1s:
+                return out
+
+            # ── First page: Balance From + Running Totals BF ──
+            for y in sorted(rby0.keys()):
+                rw = sorted(rby0[y], key=lambda w: w['x0'])
+                texts = [w['text'] for w in rw]
+                if 'Balance' in texts and 'From' in texts:
+                    for w in rw:
+                        if re.match(r'^\d{2}/\d{2}/\d{2}$', w['text']):
+                            out['bf_date'] = w['text']
+                    out['bf_vals'] = _matrix_words_to_vals(rw, col_x1s)
+                elif ('bf_vals' in out and 'rt_bf_vals' not in out and
+                      not any(w['text'] in ('Debit', 'Credit', 'Balance', 'From') for w in rw)):
+                    nums = [w for w in rw if re.match(r'^-?[\d,]+\.?\d*$', w['text'])]
+                    if len(nums) >= 5:
+                        out['rt_bf_vals'] = _matrix_words_to_vals(rw, col_x1s)
+
+            # ── Last page: Total + Running Totals CF + Final Balance ──
+            last = pdf.pages[-1]
+            rby_last = defaultdict(list)
+            for w in last.extract_words():
+                rby_last[round(w['top'] / 2) * 2].append(w)
+
+            total_y = None
+            post_count = 0
+            for y in sorted(rby_last.keys()):
+                rw = sorted(rby_last[y], key=lambda w: w['x0'])
+                texts = [w['text'] for w in rw]
+                if 'Total' in texts and total_y is None:
+                    total_y = y
+                    out['total_vals'] = _matrix_words_to_vals(rw, col_x1s)
+                elif total_y and y > total_y:
+                    nums = [w for w in rw if re.match(r'^-?[\d,]+\.?\d*$', w['text'])
+                            or w['text'] == '-']
+                    if len(nums) >= 3:
+                        if post_count == 0:
+                            out['rt_cf_vals'] = _matrix_words_to_vals(rw, col_x1s)
+                        elif post_count == 1:
+                            out['fb_vals'] = _matrix_words_to_vals(rw, col_x1s)
+                        post_count += 1
+    except:
+        pass
+    return out
+
 def convert_matrix_trial_balance(pdf_bytes, company_name, report_date):
-    rows = extract_matrix_rows(pdf_bytes)
+    rows    = extract_matrix_rows(pdf_bytes)
+    special = _extract_matrix_special(pdf_bytes)
 
     if not rows:
         raise ValueError("ไม่พบข้อมูลใน PDF — กรุณาตรวจสอบว่าเป็น Matrix Trial Balance ที่รองรับ")
@@ -178,7 +281,7 @@ def convert_matrix_trial_balance(pdf_bytes, company_name, report_date):
 
     white_f  = Font(name='Arial', bold=True, size=9,  color="FFFFFF")
     data_f   = Font(name='Arial', size=9)
-    total_f  = Font(name='Arial', bold=True, size=9)
+    bold_f   = Font(name='Arial', bold=True, size=9)
     title_f  = Font(name='Arial', bold=True, size=13, color="1F4E79")
     sub_f    = Font(name='Arial', bold=True, size=10, color="2E75B6")
     c_align  = Alignment(horizontal='center', vertical='center', wrap_text=True)
@@ -190,16 +293,34 @@ def convert_matrix_trial_balance(pdf_bytes, company_name, report_date):
     hdr_fill = PatternFill("solid", fgColor="1F4E79")
     sub_fill = PatternFill("solid", fgColor="2E75B6")
     tot_fill = PatternFill("solid", fgColor="D6E4F0")
+    bf_fill  = PatternFill("solid", fgColor="EAF0FB")   # Balance-From rows
+    rt_fill  = PatternFill("solid", fgColor="F5F5F5")   # Running-Totals rows
     alt_fill = PatternFill("solid", fgColor="F2F7FB")
     num_fmt  = '#,##0.00;[Red](#,##0.00);"-"'
+    num_cols = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]   # C..M
 
-    # ── Row 1: Company name ──
+    def write_num_row(er, label, vals_11, fill, font, bold_border=False):
+        """Write one special row: A=label(merged A:B), C..M = vals_11[0..10]."""
+        bdr = Border(left=thin, right=thin,
+                     top=(medium if bold_border else thin),
+                     bottom=(medium if bold_border else thin))
+        ws.merge_cells(f'A{er}:B{er}')
+        c = ws.cell(row=er, column=1, value=label)
+        c.font = font; c.fill = fill; c.alignment = l_align; c.border = bdr
+        ws.cell(row=er, column=2).fill = fill
+        ws.cell(row=er, column=2).border = bdr
+        for col_idx, v in zip(num_cols, vals_11):
+            c = ws.cell(row=er, column=col_idx, value=v)
+            c.font = font; c.fill = fill; c.alignment = r_align; c.border = bdr
+            if v is not None: c.number_format = num_fmt
+        ws.row_dimensions[er].height = 16
+
+    # ── Rows 1-3: title / subtitle / spacer ──
     ws.merge_cells('A1:M1')
     ws['A1'] = company_name
     ws['A1'].font = title_f; ws['A1'].alignment = c_align
     ws.row_dimensions[1].height = 26
 
-    # ── Row 2: Report title + date ──
     ws.merge_cells('A2:K2')
     ws['A2'] = 'New Matrix Trial Balance Report'
     ws['A2'].font = sub_f; ws['A2'].alignment = l_align
@@ -208,46 +329,41 @@ def convert_matrix_trial_balance(pdf_bytes, company_name, report_date):
     ws.row_dimensions[2].height = 20
     ws.row_dimensions[3].height = 5
 
-    # ── Row 4-5: Headers (2-level) ──
-    # Top level spans
-    top_headers = [
-        ('A4', 'A5', 'Trn. Code'),
-        ('B4', 'B5', 'Description'),
-        ('C4', 'C5', 'Net Amount'),
-        ('D4', 'E4', 'Deposit Ledger'),
-        ('F4', 'G4', 'Guest Ledger'),
-        ('H4', 'I4', 'Package Ledger'),
-        ('J4', 'K4', 'A/R Ledger'),
-        ('L4', 'L5', 'Internal DB'),
-        ('M4', 'M5', 'Net Revenue'),
-    ]
-    for start, end, label in top_headers:
-        if start != end:
-            ws.merge_cells(f'{start}:{end}')
-        c = ws[start]
-        c.value = label
+    # ── Rows 4-5: 2-level column headers ──
+    for start, end, label in [
+        ('A4','A5','Trn. Code'), ('B4','B5','Description'), ('C4','C5','Net Amount'),
+        ('D4','E4','Deposit Ledger'), ('F4','G4','Guest Ledger'),
+        ('H4','I4','Package Ledger'), ('J4','K4','A/R Ledger'),
+        ('L4','L5','Internal DB'),   ('M4','M5','Net Revenue'),
+    ]:
+        if start != end: ws.merge_cells(f'{start}:{end}')
+        c = ws[start]; c.value = label
         c.font = white_f; c.fill = hdr_fill; c.alignment = c_align; c.border = t_border
 
-    # Sub-level (row 5): Debit/Credit for ledger columns
-    sub_cols = {'D5': 'Debit', 'E5': 'Credit', 'F5': 'Debit', 'G5': 'Credit',
-                'H5': 'Debit', 'I5': 'Credit', 'J5': 'Debit', 'K5': 'Credit'}
-    for cell_ref, label in sub_cols.items():
-        c = ws[cell_ref]
-        c.value = label
+    for ref, lbl in [('D5','Debit'),('E5','Credit'),('F5','Debit'),('G5','Credit'),
+                     ('H5','Debit'),('I5','Credit'),('J5','Debit'),('K5','Credit')]:
+        c = ws[ref]; c.value = lbl
         c.font = white_f; c.fill = sub_fill; c.alignment = c_align; c.border = t_border
-    # Fill remaining row-5 merged cells (A5,B5,C5,L5,M5 already merged)
-    for ref in ['A5', 'B5', 'C5', 'L5', 'M5']:
+    for ref in ['A5','B5','C5','L5','M5']:
         ws[ref].fill = hdr_fill; ws[ref].border = t_border
+    ws.row_dimensions[4].height = 22; ws.row_dimensions[5].height = 18
 
-    ws.row_dimensions[4].height = 22
-    ws.row_dimensions[5].height = 18
+    cur_row = 6  # next Excel row to write
+
+    # ── Balance From row (from PDF header) ──
+    if 'bf_vals' in special:
+        bf_label = f"Balance From  {special.get('bf_date','')}"
+        write_num_row(cur_row, bf_label, special['bf_vals'], bf_fill, bold_f)
+        cur_row += 1
+
+    # ── Running Totals BF row ──
+    if 'rt_bf_vals' in special:
+        write_num_row(cur_row, 'Running Totals B/F', special['rt_bf_vals'], rt_fill, data_f)
+        cur_row += 1
 
     # ── Data rows ──
-    num_cols = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]  # columns C..M (1-indexed)
-    totals   = [0.0] * 11
-
+    data_start = cur_row
     for i, row in enumerate(rows):
-        er   = 6 + i
         fill = alt_fill if i % 2 == 0 else PatternFill("solid", fgColor="FFFFFF")
         vals = [
             row['trn_code'], row['desc'],
@@ -259,48 +375,46 @@ def convert_matrix_trial_balance(pdf_bytes, company_name, report_date):
             clean_num(row['int_db']),   clean_num(row['net_rev']),
         ]
         for col, val in enumerate(vals, 1):
-            c = ws.cell(row=er, column=col, value=val)
+            c = ws.cell(row=cur_row, column=col, value=val)
             c.font = data_f; c.fill = fill; c.border = t_border
             if col == 1:   c.alignment = c_align
             elif col == 2: c.alignment = l_align
             else:
                 c.alignment = r_align
                 if val is not None: c.number_format = num_fmt
-        for j, v in enumerate(vals[2:]):
-            if v: totals[j] += v
-        ws.row_dimensions[er].height = 14
+        ws.row_dimensions[cur_row].height = 14
+        cur_row += 1
 
-    # ── Total row ──
-    tr = 6 + len(rows)
-    ws.merge_cells(f'A{tr}:B{tr}')
-    c = ws.cell(row=tr, column=1, value='Total')
-    c.font = total_f; c.alignment = c_align
-    c.fill = tot_fill; c.border = Border(left=thin, right=thin, top=medium, bottom=medium)
-    ws.cell(row=tr, column=2).fill = tot_fill
-    ws.cell(row=tr, column=2).border = Border(left=thin, right=thin, top=medium, bottom=medium)
+    # ── Total row — use PDF values (exact, no floating-point drift) ──
+    total_vals = special.get('total_vals', [None] * 11)
+    write_num_row(cur_row, 'Total', total_vals, tot_fill, bold_f, bold_border=True)
+    cur_row += 1
 
-    for col_idx, total in zip(num_cols, totals):
-        c = ws.cell(row=tr, column=col_idx, value=total if total != 0 else None)
-        c.fill = tot_fill; c.font = total_f
-        c.border = Border(left=thin, right=thin, top=medium, bottom=medium)
-        c.alignment = r_align
-        if total != 0: c.number_format = num_fmt
-    ws.row_dimensions[tr].height = 20
+    # ── Running Totals CF + Final Balance rows ──
+    if 'rt_cf_vals' in special:
+        write_num_row(cur_row, 'Running Totals C/F', special['rt_cf_vals'], rt_fill, data_f)
+        cur_row += 1
+    if 'fb_vals' in special:
+        fb_label = f"Balance As At  {report_date}"
+        write_num_row(cur_row, fb_label, special['fb_vals'], bf_fill, bold_f)
+        cur_row += 1
 
-    # ── Column widths ──
-    col_widths = [9, 32, 16, 14, 14, 14, 14, 14, 14, 14, 14, 14, 16]
-    for i, cw in enumerate(col_widths, 1):
+    # ── Column widths & sheet settings ──
+    for i, cw in enumerate([9, 32, 16, 14, 14, 14, 14, 14, 14, 14, 14, 14, 16], 1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = cw
 
-    ws.freeze_panes = 'C6'
+    ws.freeze_panes = f'C{data_start}'
     ws.page_setup.orientation = 'landscape'
     ws.page_setup.fitToPage  = True
     ws.page_setup.fitToWidth = 1
 
+    # Total Net Amount from PDF (index 0 of total_vals)
+    total_net = total_vals[0] if total_vals and total_vals[0] is not None else 0.0
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
-    return buf, len(rows), totals[0]  # (buf, row_count, total_net_amt)
+    return buf, len(rows), total_net
 
 
 # ─── Trial Balance ───────────────────────────────────────────────────
