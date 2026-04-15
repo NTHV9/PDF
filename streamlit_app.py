@@ -38,15 +38,269 @@ def clean_text(val):
 
 # ─── PDF Type Detection ──────────────────────────────────────────────
 def detect_pdf_type(pdf_bytes):
-    """Returns 'statement' or 'trial_balance'."""
+    """Returns 'statement', 'matrix_trial_balance', or 'trial_balance'."""
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = (pdf.pages[0].extract_text() or '').upper()
             if 'STATEMENT OF ACCOUNT' in text:
                 return 'statement'
+            if 'MATRIX TRIAL BALANCE' in text:
+                return 'matrix_trial_balance'
     except:
         pass
     return 'trial_balance'
+
+
+# ─── Matrix Trial Balance ────────────────────────────────────────────
+def detect_info_matrix(pdf_bytes):
+    """Returns (company_name, report_date) from Matrix Trial Balance PDF.
+    Line 0 format: 'Company Name DD/MM/YY'
+    """
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            text = pdf.pages[0].extract_text() or ''
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            if lines:
+                # First non-empty line: "Katathani Phuket Beach Resort 19/03/26"
+                first = lines[0]
+                m = re.search(r'(\d{2}/\d{2}/\d{2})\s*$', first)
+                if m:
+                    date    = m.group(1)
+                    company = first[:m.start()].strip()
+                else:
+                    company = first
+                    date    = ''
+                return company, date
+    except:
+        pass
+    return '', ''
+
+def extract_matrix_rows(pdf_bytes):
+    """Extract all data rows from a New Matrix Trial Balance PDF."""
+    all_rows = []
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words()
+            rows_by_y = defaultdict(list)
+            for w in words:
+                rows_by_y[round(w['top'] / 2) * 2].append(w)
+
+            # ── Detect column x1 anchors from "Debit/Credit" sub-header ──
+            col_x1s = None
+            header_sub_y = 0
+            for y in sorted(rows_by_y.keys()):
+                rw = sorted(rows_by_y[y], key=lambda w: w['x0'])
+                dc_count = sum(1 for w in rw if w['text'] in ('Debit', 'Credit'))
+                if dc_count >= 3:
+                    col_x1s = sorted(w['x1'] for w in rw if w['text'] in ('Debit', 'Credit'))
+                    header_sub_y = y
+                    break
+
+            if not col_x1s or len(col_x1s) < 8:
+                continue
+
+            # ── Parse each data row ──
+            for y in sorted(rows_by_y.keys()):
+                if y <= header_sub_y:
+                    continue
+
+                ws = sorted(rows_by_y[y], key=lambda w: w['x0'])
+                if not ws:
+                    continue
+                # Must start with a pure-digit Trn Code at far left
+                if not re.match(r'^\d+$', ws[0]['text']) or ws[0]['x0'] > 5:
+                    continue
+
+                trn_code = ws[0]['text']
+
+                # ── Merge "- number" into a single negative token ──
+                merged = []
+                i = 1  # skip trn_code already recorded
+                while i < len(ws):
+                    w = ws[i]
+                    if (w['text'] == '-' and i + 1 < len(ws) and
+                            ws[i + 1]['x0'] - w['x1'] < 5 and
+                            re.match(r'^[\d,]+', ws[i + 1]['text'])):
+                        merged.append({'x0': w['x0'], 'x1': ws[i + 1]['x1'],
+                                       'text': '-' + ws[i + 1]['text']})
+                        i += 2
+                    else:
+                        merged.append(w)
+                        i += 1
+
+                # ── Assign words to fields using x1-based column detection ──
+                desc_parts = []
+                net_amt    = ''
+                values     = {ci: '' for ci in range(len(col_x1s))}
+                net_rev    = ''
+
+                for w in merged:
+                    x0, x1, t = w['x0'], w['x1'], w['text']
+                    is_num = bool(re.match(r'^-?[\d,]+\.?\d*$', t))
+
+                    if x1 < col_x1s[0] - 30:       # left zone: description or net_amt
+                        if is_num:
+                            net_amt = t
+                        elif x0 >= 20:
+                            desc_parts.append(t)
+                    elif x1 > col_x1s[-1] + 5:     # right of last ledger col = Net Revenue
+                        net_rev = t
+                    else:
+                        best_col = min(range(len(col_x1s)),
+                                       key=lambda ci: abs(x1 - col_x1s[ci]))
+                        if abs(x1 - col_x1s[best_col]) < 30:
+                            values[best_col] = t
+
+                all_rows.append({
+                    'trn_code': trn_code,
+                    'desc':     ' '.join(desc_parts),
+                    'net_amt':  net_amt,
+                    'dep_dr':   values.get(0, ''), 'dep_cr':   values.get(1, ''),
+                    'guest_dr': values.get(2, ''), 'guest_cr': values.get(3, ''),
+                    'pkg_dr':   values.get(4, ''), 'pkg_cr':   values.get(5, ''),
+                    'ar_dr':    values.get(6, ''), 'ar_cr':    values.get(7, ''),
+                    'int_db':   values.get(8, ''),
+                    'net_rev':  net_rev,
+                })
+
+    return all_rows
+
+def convert_matrix_trial_balance(pdf_bytes, company_name, report_date):
+    rows = extract_matrix_rows(pdf_bytes)
+
+    if not rows:
+        raise ValueError("ไม่พบข้อมูลใน PDF — กรุณาตรวจสอบว่าเป็น Matrix Trial Balance ที่รองรับ")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Matrix Trial Balance"
+
+    white_f  = Font(name='Arial', bold=True, size=9,  color="FFFFFF")
+    data_f   = Font(name='Arial', size=9)
+    total_f  = Font(name='Arial', bold=True, size=9)
+    title_f  = Font(name='Arial', bold=True, size=13, color="1F4E79")
+    sub_f    = Font(name='Arial', bold=True, size=10, color="2E75B6")
+    c_align  = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    l_align  = Alignment(horizontal='left',   vertical='center', wrap_text=True)
+    r_align  = Alignment(horizontal='right',  vertical='center')
+    thin     = Side(style='thin',   color='BFBFBF')
+    medium   = Side(style='medium', color='2E75B6')
+    t_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    hdr_fill = PatternFill("solid", fgColor="1F4E79")
+    sub_fill = PatternFill("solid", fgColor="2E75B6")
+    tot_fill = PatternFill("solid", fgColor="D6E4F0")
+    alt_fill = PatternFill("solid", fgColor="F2F7FB")
+    num_fmt  = '#,##0.00;[Red](#,##0.00);"-"'
+
+    # ── Row 1: Company name ──
+    ws.merge_cells('A1:M1')
+    ws['A1'] = company_name
+    ws['A1'].font = title_f; ws['A1'].alignment = c_align
+    ws.row_dimensions[1].height = 26
+
+    # ── Row 2: Report title + date ──
+    ws.merge_cells('A2:K2')
+    ws['A2'] = 'New Matrix Trial Balance Report'
+    ws['A2'].font = sub_f; ws['A2'].alignment = l_align
+    ws['L2'] = 'Date:'; ws['L2'].font = Font(name='Arial', bold=True, size=9); ws['L2'].alignment = r_align
+    ws['M2'] = report_date; ws['M2'].font = Font(name='Arial', size=9); ws['M2'].alignment = c_align
+    ws.row_dimensions[2].height = 20
+    ws.row_dimensions[3].height = 5
+
+    # ── Row 4-5: Headers (2-level) ──
+    # Top level spans
+    top_headers = [
+        ('A4', 'A5', 'Trn. Code'),
+        ('B4', 'B5', 'Description'),
+        ('C4', 'C5', 'Net Amount'),
+        ('D4', 'E4', 'Deposit Ledger'),
+        ('F4', 'G4', 'Guest Ledger'),
+        ('H4', 'I4', 'Package Ledger'),
+        ('J4', 'K4', 'A/R Ledger'),
+        ('L4', 'L5', 'Internal DB'),
+        ('M4', 'M5', 'Net Revenue'),
+    ]
+    for start, end, label in top_headers:
+        if start != end:
+            ws.merge_cells(f'{start}:{end}')
+        c = ws[start]
+        c.value = label
+        c.font = white_f; c.fill = hdr_fill; c.alignment = c_align; c.border = t_border
+
+    # Sub-level (row 5): Debit/Credit for ledger columns
+    sub_cols = {'D5': 'Debit', 'E5': 'Credit', 'F5': 'Debit', 'G5': 'Credit',
+                'H5': 'Debit', 'I5': 'Credit', 'J5': 'Debit', 'K5': 'Credit'}
+    for cell_ref, label in sub_cols.items():
+        c = ws[cell_ref]
+        c.value = label
+        c.font = white_f; c.fill = sub_fill; c.alignment = c_align; c.border = t_border
+    # Fill remaining row-5 merged cells (A5,B5,C5,L5,M5 already merged)
+    for ref in ['A5', 'B5', 'C5', 'L5', 'M5']:
+        ws[ref].fill = hdr_fill; ws[ref].border = t_border
+
+    ws.row_dimensions[4].height = 22
+    ws.row_dimensions[5].height = 18
+
+    # ── Data rows ──
+    num_cols = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]  # columns C..M (1-indexed)
+    totals   = [0.0] * 11
+
+    for i, row in enumerate(rows):
+        er   = 6 + i
+        fill = alt_fill if i % 2 == 0 else PatternFill("solid", fgColor="FFFFFF")
+        vals = [
+            row['trn_code'], row['desc'],
+            clean_num(row['net_amt']),
+            clean_num(row['dep_dr']),   clean_num(row['dep_cr']),
+            clean_num(row['guest_dr']), clean_num(row['guest_cr']),
+            clean_num(row['pkg_dr']),   clean_num(row['pkg_cr']),
+            clean_num(row['ar_dr']),    clean_num(row['ar_cr']),
+            clean_num(row['int_db']),   clean_num(row['net_rev']),
+        ]
+        for col, val in enumerate(vals, 1):
+            c = ws.cell(row=er, column=col, value=val)
+            c.font = data_f; c.fill = fill; c.border = t_border
+            if col == 1:   c.alignment = c_align
+            elif col == 2: c.alignment = l_align
+            else:
+                c.alignment = r_align
+                if val is not None: c.number_format = num_fmt
+        for j, v in enumerate(vals[2:]):
+            if v: totals[j] += v
+        ws.row_dimensions[er].height = 14
+
+    # ── Total row ──
+    tr = 6 + len(rows)
+    ws.merge_cells(f'A{tr}:B{tr}')
+    c = ws.cell(row=tr, column=1, value='Total')
+    c.font = total_f; c.alignment = c_align
+    c.fill = tot_fill; c.border = Border(left=thin, right=thin, top=medium, bottom=medium)
+    ws.cell(row=tr, column=2).fill = tot_fill
+    ws.cell(row=tr, column=2).border = Border(left=thin, right=thin, top=medium, bottom=medium)
+
+    for col_idx, total in zip(num_cols, totals):
+        c = ws.cell(row=tr, column=col_idx, value=total if total != 0 else None)
+        c.fill = tot_fill; c.font = total_f
+        c.border = Border(left=thin, right=thin, top=medium, bottom=medium)
+        c.alignment = r_align
+        if total != 0: c.number_format = num_fmt
+    ws.row_dimensions[tr].height = 20
+
+    # ── Column widths ──
+    col_widths = [9, 32, 16, 14, 14, 14, 14, 14, 14, 14, 14, 14, 16]
+    for i, cw in enumerate(col_widths, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = cw
+
+    ws.freeze_panes = 'C6'
+    ws.page_setup.orientation = 'landscape'
+    ws.page_setup.fitToPage  = True
+    ws.page_setup.fitToWidth = 1
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf, len(rows), totals[0]  # (buf, row_count, total_net_amt)
 
 
 # ─── Trial Balance ───────────────────────────────────────────────────
@@ -512,7 +766,7 @@ def get_print_date(pdf_bytes):
 
 # ─── UI ─────────────────────────────────────────────────────────────
 st.markdown("## 📊 PDF → Excel ตัวไหนไม่ได้แจ้งก้องนะครับ")
-st.markdown("รองรับ 2 ประเภท: **งบทดลอง** และ **Statement of Account**")
+st.markdown("รองรับ 3 ประเภท: 1.งบทดลอง 2.Statement of Account 3.Matrix trial balance")
 st.divider()
 
 uploaded = st.file_uploader(
@@ -524,6 +778,8 @@ uploaded = st.file_uploader(
 if uploaded:
     pdf_bytes = uploaded.read()
     pdf_type  = detect_pdf_type(pdf_bytes)
+
+    def fmt(n): return f"{n:,.2f}" if n else "-"
 
     if pdf_type == 'statement':
         client_name = detect_company_soa(pdf_bytes)
@@ -539,18 +795,41 @@ if uploaded:
                     st.success(f"✅ แปลงสำเร็จ — **{row_count:,} รายการ**")
 
                     col1, col2, col3 = st.columns(3)
-                    def fmt(n): return f"{n:,.2f}" if n else "-"
                     col1.metric("Total Debit",   fmt(td))
                     col2.metric("Total Credit",  fmt(tc) if tc else "-")
                     col3.metric("Total Balance", fmt(tb))
 
                     st.download_button(
                         label="⬇️ ดาวน์โหลด Excel",
-                        data=buf,
-                        file_name=xlsx_name,
+                        data=buf, file_name=xlsx_name,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        type="primary"
+                        use_container_width=True, type="primary"
+                    )
+                except Exception as e:
+                    st.error(f"❌ เกิดข้อผิดพลาด: {e}")
+
+    elif pdf_type == 'matrix_trial_balance':
+        company_name, report_date = detect_info_matrix(pdf_bytes)
+        st.info(f"📊 ตรวจพบ: **New Matrix Trial Balance** — {company_name}")
+
+        if st.button("🔄 แปลงเป็น Excel", type="primary", use_container_width=True):
+            with st.spinner("กำลังอ่าน PDF และสร้างไฟล์ Excel..."):
+                try:
+                    buf, row_count, total_net = convert_matrix_trial_balance(
+                        pdf_bytes, company_name, report_date)
+                    xlsx_name = uploaded.name.replace('.pdf', '.xlsx').replace('.PDF', '.xlsx')
+
+                    st.success(f"✅ แปลงสำเร็จ — **{row_count:,} รายการ**")
+
+                    col1, col2 = st.columns(2)
+                    col1.metric("รายการทั้งหมด", f"{row_count:,}")
+                    col2.metric("Net Amount รวม", fmt(total_net))
+
+                    st.download_button(
+                        label="⬇️ ดาวน์โหลด Excel",
+                        data=buf, file_name=xlsx_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True, type="primary"
                     )
                 except Exception as e:
                     st.error(f"❌ เกิดข้อผิดพลาด: {e}")
@@ -568,21 +847,18 @@ if uploaded:
                     st.success(f"✅ แปลงสำเร็จ — **{row_count:,} รายการ**")
 
                     col1, col2, col3 = st.columns(3)
-                    def fmt(n): return f"{n:,.2f}" if n else "-"
                     col1.metric("ยอดยกมา (Dr)",   fmt(totals[0]))
                     col2.metric("ยอดสะสม (Dr)",   fmt(totals[2]))
                     col3.metric("ยอดยกไป (Dr)",   fmt(totals[4]))
 
                     st.download_button(
                         label="⬇️ ดาวน์โหลด Excel",
-                        data=buf,
-                        file_name=xlsx_name,
+                        data=buf, file_name=xlsx_name,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        type="primary"
+                        use_container_width=True, type="primary"
                     )
                 except Exception as e:
                     st.error(f"❌ เกิดข้อผิดพลาด: {e}")
 
 st.divider()
-st.caption("💡 ระบบตรวจจับประเภท PDF อัตโนมัติ — รองรับเฉพาะ searchable PDF (ไม่ใช่ภาพสแกน)")
+st.caption("💡 ระบบตรวจจับประเภท PDF อัตโนมัติ — รองรับเฉพาะ searchable PDF (ไม่ใช่ภาพสแก 
