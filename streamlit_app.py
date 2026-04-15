@@ -315,6 +315,47 @@ def convert_matrix_trial_balance(pdf_bytes, company_name, report_date):
             if v is not None: c.number_format = num_fmt
         ws.row_dimensions[er].height = 16
 
+    def write_balance_row(er, label, vals_11, fill, font):
+        """Write a Balance-From / Balance-As-At row where each ledger has ONE
+        net value (not split Debit/Credit).  Pairs D:E, F:G, H:I, J:K are
+        merged and the value is centred inside the merged cell.
+        vals_11 layout: [net_amt, dep, None, guest, None, pkg, None, ar, None, int_db, net_rev]
+        """
+        bdr = Border(left=thin, right=thin, top=thin, bottom=thin)
+        ws.merge_cells(f'A{er}:B{er}')
+        c = ws.cell(row=er, column=1, value=label)
+        c.font = font; c.fill = fill; c.alignment = l_align; c.border = bdr
+        ws.cell(row=er, column=2).fill = fill
+        ws.cell(row=er, column=2).border = bdr
+
+        # C: Net Amount
+        c = ws.cell(row=er, column=3, value=vals_11[0])
+        c.font = font; c.fill = fill; c.alignment = r_align; c.border = bdr
+        if vals_11[0] is not None: c.number_format = num_fmt
+
+        # D:E → Deposit (single net value)
+        # F:G → Guest,  H:I → Package,  J:K → A/R
+        pairs = [
+            (4, 5,  vals_11[1]),   # Deposit  cols D:E
+            (6, 7,  vals_11[3]),   # Guest    cols F:G
+            (8, 9,  vals_11[5]),   # Package  cols H:I
+            (10, 11, vals_11[7]),  # A/R      cols J:K
+        ]
+        for col_start, col_end, v in pairs:
+            ws.merge_cells(start_row=er, start_column=col_start,
+                           end_row=er,   end_column=col_end)
+            c = ws.cell(row=er, column=col_start, value=v)
+            c.font = font; c.fill = fill; c.alignment = r_align; c.border = bdr
+            if v is not None: c.number_format = num_fmt
+
+        # L: Internal DB,  M: Net Revenue
+        for col_idx, v in [(12, vals_11[9]), (13, vals_11[10])]:
+            c = ws.cell(row=er, column=col_idx, value=v)
+            c.font = font; c.fill = fill; c.alignment = r_align; c.border = bdr
+            if v is not None: c.number_format = num_fmt
+
+        ws.row_dimensions[er].height = 16
+
     # ── Rows 1-3: title / subtitle / spacer ──
     ws.merge_cells('A1:M1')
     ws['A1'] = company_name
@@ -353,7 +394,7 @@ def convert_matrix_trial_balance(pdf_bytes, company_name, report_date):
     # ── Balance From row (from PDF header) ──
     if 'bf_vals' in special:
         bf_label = f"Balance From  {special.get('bf_date','')}"
-        write_num_row(cur_row, bf_label, special['bf_vals'], bf_fill, bold_f)
+        write_balance_row(cur_row, bf_label, special['bf_vals'], bf_fill, bold_f)
         cur_row += 1
 
     # ── Running Totals BF row ──
@@ -396,7 +437,7 @@ def convert_matrix_trial_balance(pdf_bytes, company_name, report_date):
         cur_row += 1
     if 'fb_vals' in special:
         fb_label = f"Balance As At  {report_date}"
-        write_num_row(cur_row, fb_label, special['fb_vals'], bf_fill, bold_f)
+        write_balance_row(cur_row, fb_label, special['fb_vals'], bf_fill, bold_f)
         cur_row += 1
 
     # ── Column widths & sheet settings ──
