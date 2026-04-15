@@ -12,19 +12,11 @@ st.set_page_config(
     layout="centered"
 )
 
-# ─── CSS ────────────────────────────────────────────────────────────
+# ─── CSS (theme-aware — no hardcoded background) ────────────────────
 st.markdown("""
 <style>
-[data-testid="stAppViewContainer"] { background: #f0f4f8; }
-.main-card {
-    background: white;
-    border-radius: 16px;
-    padding: 32px 36px;
-    box-shadow: 0 4px 24px rgba(0,0,0,0.08);
-    margin-bottom: 24px;
-}
-.stat-label { font-size: 12px; color: #64748b; margin-bottom: 4px; }
-.stat-value { font-size: 14px; font-weight: 700; color: #1F4E79; }
+.stat-label { font-size: 12px; margin-bottom: 4px; }
+.stat-value { font-size: 14px; font-weight: 700; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -249,12 +241,20 @@ def extract_statement_rows(pdf_bytes):
                 elif current_row:
                     if y - last_primary_y > 60:
                         continue   # skip aging/summary section
-                    if desc_w:
-                        cont = ' '.join(desc_w)
-                        if cont.replace('.1', '') != current_row['voucher'].replace('.1', ''):
-                            current_row['desc'] = (current_row['desc'] + ' ' + cont).strip()
-                    if vch_w:
-                        current_row['voucher'] = (current_row['voucher'] + ' ' + ' '.join(vch_w)).strip()
+
+                    # Skip repeated column-header rows (Trip.com and other PDFs repeat headers per page)
+                    desc_cont = ' '.join(desc_w).strip()
+                    vch_cont  = ' '.join(vch_w).strip()
+                    HEADER_WORDS = {'description', 'voucher', 'folio', 'arrival', 'departure',
+                                    'debit', 'credit', 'balance', 'date'}
+                    if desc_cont.lower() in HEADER_WORDS or vch_cont.lower() in HEADER_WORDS:
+                        continue   # this is a repeated header row — skip entirely
+
+                    if desc_cont:
+                        if desc_cont.replace('.1', '') != current_row['voucher'].replace('.1', ''):
+                            current_row['desc'] = (current_row['desc'] + ' ' + desc_cont).strip()
+                    if vch_cont:
+                        current_row['voucher'] = (current_row['voucher'] + ' ' + vch_cont).strip()
 
     if current_row:
         all_rows.append(current_row)
