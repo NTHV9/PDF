@@ -3,10 +3,11 @@ import io
 import pdfplumber
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from collections import defaultdict
 import streamlit as st
 
 st.set_page_config(
-    page_title="PDF → Excel | งบทดลอง",
+    page_title="PDF → Excel Converter",
     page_icon="📊",
     layout="centered"
 )
@@ -22,18 +23,13 @@ st.markdown("""
     box-shadow: 0 4px 24px rgba(0,0,0,0.08);
     margin-bottom: 24px;
 }
-.stat-row { display: flex; gap: 12px; margin: 16px 0; }
-.stat-box {
-    flex: 1; background: #f0f9ff; border: 1.5px solid #bae6fd;
-    border-radius: 10px; padding: 12px; text-align: center;
-}
 .stat-label { font-size: 12px; color: #64748b; margin-bottom: 4px; }
 .stat-value { font-size: 14px; font-weight: 700; color: #1F4E79; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─── Helpers ────────────────────────────────────────────────────────
+# ─── Shared Helpers ──────────────────────────────────────────────────
 def clean_num(val):
     if not val or str(val).strip() == '':
         return None
@@ -47,7 +43,22 @@ def clean_text(val):
         return ''
     return re.sub(r'[\uf700-\uf7ff]', '', str(val)).strip()
 
-def detect_company(pdf_bytes):
+
+# ─── PDF Type Detection ──────────────────────────────────────────────
+def detect_pdf_type(pdf_bytes):
+    """Returns 'statement' or 'trial_balance'."""
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            text = (pdf.pages[0].extract_text() or '').upper()
+            if 'STATEMENT OF ACCOUNT' in text:
+                return 'statement'
+    except:
+        pass
+    return 'trial_balance'
+
+
+# ─── Trial Balance ───────────────────────────────────────────────────
+def detect_company_tb(pdf_bytes):
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = pdf.pages[0].extract_text() or ''
@@ -56,7 +67,7 @@ def detect_company(pdf_bytes):
     except:
         return ''
 
-def convert(pdf_bytes, company_name):
+def convert_trial_balance(pdf_bytes, company_name):
     all_rows = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -106,20 +117,20 @@ def convert(pdf_bytes, company_name):
     ws.row_dimensions[2].height = 22
     ws.row_dimensions[3].height = 8
 
-    for cells, fill in [('A4:A5',''), ('B4:B5',''), ('C4:D4',''), ('E4:F4',''), ('G4:H4','')]:
+    for cells in ['A4:A5', 'B4:B5', 'C4:D4', 'E4:F4', 'G4:H4']:
         ws.merge_cells(cells)
-    top_labels = ['เลขที่บัญชี','ชื่อบัญชี','ยอดยกมา','','ยอดสะสมประจำงวด','','ยอดยกไป','']
-    sub_labels = ['','','เดบิต','เครดิต','เดบิต','เครดิต','เดบิต','เครดิต']
+    top_labels = ['เลขที่บัญชี', 'ชื่อบัญชี', 'ยอดยกมา', '', 'ยอดสะสมประจำงวด', '', 'ยอดยกไป', '']
+    sub_labels = ['', '', 'เดบิต', 'เครดิต', 'เดบิต', 'เครดิต', 'เดบิต', 'เครดิต']
     for col, val in enumerate(top_labels, 1):
         c = ws.cell(row=4, column=col, value=val or None)
-        c.font=white_f; c.fill=hdr_fill; c.alignment=c_align; c.border=t_border
+        c.font = white_f; c.fill = hdr_fill; c.alignment = c_align; c.border = t_border
     for col, val in enumerate(sub_labels, 1):
         c = ws.cell(row=5, column=col, value=val or None)
-        c.font=white_f; c.fill=sub_fill; c.alignment=c_align; c.border=t_border
+        c.font = white_f; c.fill = sub_fill; c.alignment = c_align; c.border = t_border
     ws.row_dimensions[4].height = 24
     ws.row_dimensions[5].height = 20
 
-    totals = [0.0]*6
+    totals = [0.0] * 6
     for i, row in enumerate(all_rows):
         er   = 6 + i
         fill = alt_fill if i % 2 == 0 else PatternFill("solid", fgColor="FFFFFF")
@@ -129,8 +140,8 @@ def convert(pdf_bytes, company_name):
                 clean_num(row[6]), clean_num(row[7])]
         for col, val in enumerate(vals, 1):
             c = ws.cell(row=er, column=col, value=val)
-            c.font=data_f; c.fill=fill; c.border=t_border
-            c.alignment = c_align if col==1 else (l_align if col==2 else r_align)
+            c.font = data_f; c.fill = fill; c.border = t_border
+            c.alignment = c_align if col == 1 else (l_align if col == 2 else r_align)
             if col > 2 and val is not None:
                 c.number_format = num_fmt
         for j, v in enumerate(vals[2:]):
@@ -139,19 +150,19 @@ def convert(pdf_bytes, company_name):
     tr = 6 + len(all_rows)
     for col in range(1, 9):
         c = ws.cell(row=tr, column=col)
-        c.fill=tot_fill; c.font=total_f
-        c.border=Border(left=thin,right=thin,top=medium,bottom=medium)
-        c.alignment = c_align if col==1 else r_align
+        c.fill = tot_fill; c.font = total_f
+        c.border = Border(left=thin, right=thin, top=medium, bottom=medium)
+        c.alignment = c_align if col == 1 else r_align
     ws.cell(row=tr, column=1).value = 'รวม'
-    for col_idx, total in zip([3,4,5,6,7,8], totals):
+    for col_idx, total in zip([3, 4, 5, 6, 7, 8], totals):
         ws.cell(row=tr, column=col_idx).value = total
         ws.cell(row=tr, column=col_idx).number_format = num_fmt
     ws.row_dimensions[tr].height = 22
 
     ws.column_dimensions['A'].width = 16
     ws.column_dimensions['B'].width = 55
-    for c in 'CDEFGH':
-        ws.column_dimensions[c].width = 18
+    for col_letter in 'CDEFGH':
+        ws.column_dimensions[col_letter].width = 18
     ws.freeze_panes = 'C6'
     ws.page_setup.orientation = 'landscape'
     ws.page_setup.fitToPage = True
@@ -163,49 +174,276 @@ def convert(pdf_bytes, company_name):
     return buf, len(all_rows), totals
 
 
+# ─── Statement of Account ────────────────────────────────────────────
+def detect_company_soa(pdf_bytes):
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            text = pdf.pages[0].extract_text() or ''
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            name_parts = []
+            for l in lines[:6]:
+                if 'STATEMENT OF ACCOUNT' in l.upper(): continue
+                if 'A/R' in l or 'Account No' in l:
+                    part = l.split('A/R')[0].strip()
+                    if part: name_parts.append(part)
+                    continue
+                if 'Print Date' in l or 'Page No' in l: break
+                if len(l) < 40 and not any(kw in l for kw in ['Date', 'Folio', 'Debit', 'Credit']):
+                    name_parts.append(l)
+            return ' '.join(name_parts) if name_parts else ''
+    except:
+        return ''
+
+def extract_statement_rows(pdf_bytes):
+    DATE_MAX, FOLIO_MAX, DESC_MAX = 82, 131, 233
+    ARR_MAX, DEP_MAX, VCH_MAX = 278, 330, 420
+    DEBIT_X1_MAX, CREDIT_X1_MAX = 490, 540
+
+    all_rows = []
+    current_row = None
+    last_primary_y = 0
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words()
+            rows_by_y = defaultdict(list)
+            for w in words:
+                rows_by_y[round(w['top'] / 3) * 3].append(w)
+
+            for y in sorted(rows_by_y.keys()):
+                if y < 195 or y > 715:
+                    continue
+                ws_words = sorted(rows_by_y[y], key=lambda w: w['x0'])
+                date_w, folio_w, desc_w = [], [], []
+                arr_w, dep_w, vch_w = [], [], []
+                debit_w, credit_w, bal_w = [], [], []
+
+                for w in ws_words:
+                    x0, x1, t = w['x0'], w['x1'], w['text']
+                    if x0 < DATE_MAX:         date_w.append(t)
+                    elif x0 < FOLIO_MAX:      folio_w.append(t)
+                    elif x0 < DESC_MAX:       desc_w.append(t)
+                    elif x0 < ARR_MAX:        arr_w.append(t)
+                    elif x0 < DEP_MAX:        dep_w.append(t)
+                    elif x0 < VCH_MAX:        vch_w.append(t)
+                    else:
+                        if x1 <= DEBIT_X1_MAX:    debit_w.append(t)
+                        elif x1 <= CREDIT_X1_MAX:  credit_w.append(t)
+                        else:                      bal_w.append(t)
+
+                dv  = ' '.join(date_w)
+                fv  = ' '.join(folio_w)
+                is_primary = bool(dv and fv and re.match(r'\d{2}/\d{2}/\d{2}', dv))
+
+                if is_primary:
+                    if current_row:
+                        all_rows.append(current_row)
+                    last_primary_y = y
+                    current_row = {
+                        'date': dv, 'folio': fv,
+                        'desc': ' '.join(desc_w), 'arrival': ' '.join(arr_w),
+                        'departure': ' '.join(dep_w), 'voucher': ' '.join(vch_w),
+                        'debit': ' '.join(debit_w), 'credit': ' '.join(credit_w),
+                        'balance': ' '.join(bal_w),
+                    }
+                elif current_row:
+                    if y - last_primary_y > 60:
+                        continue   # skip aging/summary section
+                    if desc_w:
+                        cont = ' '.join(desc_w)
+                        if cont.replace('.1', '') != current_row['voucher'].replace('.1', ''):
+                            current_row['desc'] = (current_row['desc'] + ' ' + cont).strip()
+                    if vch_w:
+                        current_row['voucher'] = (current_row['voucher'] + ' ' + ' '.join(vch_w)).strip()
+
+    if current_row:
+        all_rows.append(current_row)
+    return all_rows
+
+def convert_statement(pdf_bytes, client_name, print_date):
+    rows = extract_statement_rows(pdf_bytes)
+
+    if not rows:
+        raise ValueError("ไม่พบข้อมูลใน PDF — กรุณาตรวจสอบว่าเป็น Statement of Account ที่รองรับ")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Statement of Account"
+
+    white_f  = Font(name='Arial', bold=True, size=10, color="FFFFFF")
+    total_f  = Font(name='Arial', bold=True, size=10)
+    title_f  = Font(name='Arial', bold=True, size=13, color="1F4E79")
+    sub_f    = Font(name='Arial', bold=True, size=11, color="2E75B6")
+    c_align  = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    l_align  = Alignment(horizontal='left',   vertical='center', wrap_text=True)
+    r_align  = Alignment(horizontal='right',  vertical='center')
+    thin     = Side(style='thin',   color='BFBFBF')
+    medium   = Side(style='medium', color='2E75B6')
+    t_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    hdr_fill = PatternFill("solid", fgColor="1F4E79")
+    tot_fill = PatternFill("solid", fgColor="D6E4F0")
+    alt_fill = PatternFill("solid", fgColor="F2F7FB")
+    num_fmt  = '#,##0.00;[Red](#,##0.00);"-"'
+
+    ws.merge_cells('A1:I1')
+    ws['A1'] = "STATEMENT OF ACCOUNT"
+    ws['A1'].font = title_f; ws['A1'].alignment = c_align
+    ws.row_dimensions[1].height = 26
+
+    ws.merge_cells('A2:G2')
+    ws['A2'] = client_name
+    ws['A2'].font = sub_f; ws['A2'].alignment = l_align
+    ws['H2'] = "Print Date:"
+    ws['H2'].font = Font(name='Arial', bold=True, size=9); ws['H2'].alignment = r_align
+    ws['I2'] = print_date
+    ws['I2'].font = Font(name='Arial', size=9); ws['I2'].alignment = c_align
+    ws.row_dimensions[2].height = 20
+    ws.row_dimensions[3].height = 5
+
+    headers = ['Date', 'Folio', 'Description', 'Arrival', 'Departure', 'Voucher', 'Debit', 'Credit', 'Balance']
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(row=4, column=col, value=h)
+        c.font = white_f; c.fill = hdr_fill
+        c.alignment = c_align; c.border = t_border
+    ws.row_dimensions[4].height = 22
+
+    for i, row in enumerate(rows):
+        er = 5 + i
+        fill = alt_fill if i % 2 == 0 else PatternFill("solid", fgColor="FFFFFF")
+        vals = [
+            row['date'], row['folio'], row['desc'],
+            row['arrival'], row['departure'], row['voucher'],
+            clean_num(row['debit']), clean_num(row['credit']), clean_num(row['balance'])
+        ]
+        for col, val in enumerate(vals, 1):
+            c = ws.cell(row=er, column=col, value=val)
+            c.font = Font(name='Arial', size=9)
+            c.fill = fill; c.border = t_border
+            if col == 3:        c.alignment = l_align
+            elif col >= 7:
+                c.alignment = r_align
+                if val is not None: c.number_format = num_fmt
+            else:               c.alignment = c_align
+        ws.row_dimensions[er].height = 16
+
+    tr = 5 + len(rows)
+    td = sum(clean_num(r['debit'])   or 0 for r in rows)
+    tc = sum(clean_num(r['credit'])  or 0 for r in rows)
+    tb = sum(clean_num(r['balance']) or 0 for r in rows)
+
+    ws.merge_cells(f'A{tr}:F{tr}')
+    c = ws.cell(row=tr, column=1, value='รวมทั้งสิ้น / Grand Total')
+    c.font = total_f; c.alignment = c_align
+    c.fill = tot_fill; c.border = Border(left=thin, right=thin, top=medium, bottom=medium)
+    for col in range(2, 7):
+        c = ws.cell(row=tr, column=col)
+        c.fill = tot_fill; c.border = Border(left=thin, right=thin, top=medium, bottom=medium)
+    for col, val in [(7, td), (8, tc if tc else None), (9, tb)]:
+        c = ws.cell(row=tr, column=col, value=val)
+        c.fill = tot_fill; c.font = total_f
+        c.border = Border(left=thin, right=thin, top=medium, bottom=medium)
+        c.alignment = r_align
+        if val is not None: c.number_format = num_fmt
+    ws.row_dimensions[tr].height = 22
+
+    col_widths = [12, 9, 42, 12, 12, 22, 16, 14, 16]
+    for i, cw in enumerate(col_widths, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = cw
+
+    ws.freeze_panes = 'A5'
+    ws.page_setup.orientation = 'landscape'
+    ws.page_setup.fitToPage = True
+    ws.page_setup.fitToWidth = 1
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf, len(rows), td, tc, tb
+
+def get_print_date(pdf_bytes):
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            text = pdf.pages[0].extract_text() or ''
+            m = re.search(r'Print\s+Date\s+(\d{2}/\d{2}/\d{2})', text)
+            if m: return m.group(1)
+    except:
+        pass
+    return ''
+
+
 # ─── UI ─────────────────────────────────────────────────────────────
-st.markdown("## 📊 PDF → Excel")
-st.markdown("แปลงงบทดลอง PDF เป็น Excel อัตโนมัติ — รองรับไฟล์จากโปรแกรมบัญชีทั่วไป")
+st.markdown("## 📊 PDF → Excel Converter")
+st.markdown("รองรับ 2 ประเภท: **งบทดลอง** และ **Statement of Account**")
 st.divider()
 
 uploaded = st.file_uploader(
-    "อัปโหลดไฟล์ PDF งบทดลอง",
+    "อัปโหลดไฟล์ PDF",
     type=['pdf'],
     help="รองรับ PDF ที่สร้างจากโปรแกรมบัญชี (ไม่ใช่ภาพสแกน)"
 )
 
 if uploaded:
     pdf_bytes = uploaded.read()
-    company_name = detect_company(pdf_bytes)
+    pdf_type  = detect_pdf_type(pdf_bytes)
 
-    if company_name:
-        st.info(f"🏢 ตรวจพบ: **{company_name}**")
+    if pdf_type == 'statement':
+        client_name = detect_company_soa(pdf_bytes)
+        print_date  = get_print_date(pdf_bytes)
+        st.info(f"📄 ตรวจพบ: **Statement of Account** — {client_name}")
 
-    if st.button("🔄 แปลงเป็น Excel", type="primary", use_container_width=True):
-        with st.spinner("กำลังอ่านตาราง PDF และสร้างไฟล์ Excel..."):
-            try:
-                buf, row_count, totals = convert(pdf_bytes, company_name)
-                xlsx_name = uploaded.name.replace('.pdf', '.xlsx').replace('.PDF', '.xlsx')
+        if st.button("🔄 แปลงเป็น Excel", type="primary", use_container_width=True):
+            with st.spinner("กำลังอ่าน PDF และสร้างไฟล์ Excel..."):
+                try:
+                    buf, row_count, td, tc, tb = convert_statement(pdf_bytes, client_name, print_date)
+                    xlsx_name = uploaded.name.replace('.pdf', '.xlsx').replace('.PDF', '.xlsx')
 
-                st.success(f"✅ แปลงสำเร็จ — **{row_count:,} รายการ**")
+                    st.success(f"✅ แปลงสำเร็จ — **{row_count:,} รายการ**")
 
-                col1, col2, col3 = st.columns(3)
-                def fmt(n): return f"{n:,.2f}" if n else "-"
-                col1.metric("ยอดยกมา (Dr)",   fmt(totals[0]))
-                col2.metric("ยอดสะสม (Dr)",   fmt(totals[2]))
-                col3.metric("ยอดยกไป (Dr)",   fmt(totals[4]))
+                    col1, col2, col3 = st.columns(3)
+                    def fmt(n): return f"{n:,.2f}" if n else "-"
+                    col1.metric("Total Debit",   fmt(td))
+                    col2.metric("Total Credit",  fmt(tc) if tc else "-")
+                    col3.metric("Total Balance", fmt(tb))
 
-                st.download_button(
-                    label="⬇️ ดาวน์โหลด Excel",
-                    data=buf,
-                    file_name=xlsx_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                    type="primary"
-                )
+                    st.download_button(
+                        label="⬇️ ดาวน์โหลด Excel",
+                        data=buf,
+                        file_name=xlsx_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        type="primary"
+                    )
+                except Exception as e:
+                    st.error(f"❌ เกิดข้อผิดพลาด: {e}")
 
-            except Exception as e:
-                st.error(f"❌ เกิดข้อผิดพลาด: {e}")
+    else:
+        company_name = detect_company_tb(pdf_bytes)
+        st.info(f"🏢 ตรวจพบ: **งบทดลอง** — {company_name}")
+
+        if st.button("🔄 แปลงเป็น Excel", type="primary", use_container_width=True):
+            with st.spinner("กำลังอ่านตาราง PDF และสร้างไฟล์ Excel..."):
+                try:
+                    buf, row_count, totals = convert_trial_balance(pdf_bytes, company_name)
+                    xlsx_name = uploaded.name.replace('.pdf', '.xlsx').replace('.PDF', '.xlsx')
+
+                    st.success(f"✅ แปลงสำเร็จ — **{row_count:,} รายการ**")
+
+                    col1, col2, col3 = st.columns(3)
+                    def fmt(n): return f"{n:,.2f}" if n else "-"
+                    col1.metric("ยอดยกมา (Dr)",   fmt(totals[0]))
+                    col2.metric("ยอดสะสม (Dr)",   fmt(totals[2]))
+                    col3.metric("ยอดยกไป (Dr)",   fmt(totals[4]))
+
+                    st.download_button(
+                        label="⬇️ ดาวน์โหลด Excel",
+                        data=buf,
+                        file_name=xlsx_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        type="primary"
+                    )
+                except Exception as e:
+                    st.error(f"❌ เกิดข้อผิดพลาด: {e}")
 
 st.divider()
-st.caption("💡 รองรับ PDF งบทดลองที่มีตารางชัดเจน (searchable PDF) เท่านั้น")
+st.caption("💡 ระบบตรวจจับประเภท PDF อัตโนมัติ — รองรับเฉพาะ searchable PDF (ไม่ใช่ภาพสแกน)")
