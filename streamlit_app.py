@@ -231,9 +231,10 @@ def extract_statement_rows(pdf_bytes):
     DEBIT_X1_MAX  = b['DEBIT_X1_MAX']
     CREDIT_X1_MAX = b['CREDIT_X1_MAX']
 
+    HEADER_WORDS = {'description', 'voucher', 'folio', 'arrival', 'departure',
+                    'debit', 'credit', 'balance', 'date'}
+
     all_rows = []
-    current_row = None
-    last_primary_y = 0
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -241,6 +242,10 @@ def extract_statement_rows(pdf_bytes):
             rows_by_y = defaultdict(list)
             for w in words:
                 rows_by_y[round(w['top'] / 3) * 3].append(w)
+
+            # ── Pass 1: identify primary rows (date + folio) ──
+            primary_ys   = []
+            primary_data = {}
 
             for y in sorted(rows_by_y.keys()):
                 if y < 195 or y > 715:
@@ -252,52 +257,83 @@ def extract_statement_rows(pdf_bytes):
 
                 for w in ws_words:
                     x0, x1, t = w['x0'], w['x1'], w['text']
-                    if x0 < DATE_MAX:         date_w.append(t)
-                    elif x0 < FOLIO_MAX:      folio_w.append(t)
-                    elif x0 < DESC_MAX:       desc_w.append(t)
-                    elif x0 < ARR_MAX:        arr_w.append(t)
-                    elif x0 < DEP_MAX:        dep_w.append(t)
-                    elif x0 < VCH_MAX:        vch_w.append(t)
+                    if x0 < DATE_MAX:          date_w.append(t)
+                    elif x0 < FOLIO_MAX:       folio_w.append(t)
+                    elif x0 < DESC_MAX:        desc_w.append(t)
+                    elif x0 < ARR_MAX:         arr_w.append(t)
+                    elif x0 < DEP_MAX:         dep_w.append(t)
+                    elif x0 < VCH_MAX:         vch_w.append(t)
                     else:
                         if x1 <= DEBIT_X1_MAX:    debit_w.append(t)
-                        elif x1 <= CREDIT_X1_MAX:  credit_w.append(t)
-                        else:                      bal_w.append(t)
+                        elif x1 <= CREDIT_X1_MAX: credit_w.append(t)
+                        else:                     bal_w.append(t)
 
-                dv  = ' '.join(date_w)
-                fv  = ' '.join(folio_w)
-                is_primary = bool(dv and fv and re.match(r'\d{2}/\d{2}/\d{2}', dv))
-
-                if is_primary:
-                    if current_row:
-                        all_rows.append(current_row)
-                    last_primary_y = y
-                    current_row = {
+                dv = ' '.join(date_w)
+                fv = ' '.join(folio_w)
+                if dv and fv and re.match(r'\d{2}/\d{2}/\d{2}', dv):
+                    primary_ys.append(y)
+                    primary_data[y] = {
                         'date': dv, 'folio': fv,
                         'desc': ' '.join(desc_w), 'arrival': ' '.join(arr_w),
                         'departure': ' '.join(dep_w), 'voucher': ' '.join(vch_w),
                         'debit': ' '.join(debit_w), 'credit': ' '.join(credit_w),
                         'balance': ' '.join(bal_w),
                     }
-                elif current_row:
-                    if y - last_primary_y > 60:
-                        continue   # skip aging/summary section
 
-                    # Skip repeated column-header rows (Trip.com and other PDFs repeat headers per page)
-                    desc_cont = ' '.join(desc_w).strip()
-                    vch_cont  = ' '.join(vch_w).strip()
-                    HEADER_WORDS = {'description', 'voucher', 'folio', 'arrival', 'departure',
-                                    'debit', 'credit', 'balance', 'date'}
-                    if desc_cont.lower() in HEADER_WORDS or vch_cont.lower() in HEADER_WORDS:
-                        continue   # this is a repeated header row — skip entirely
+            if not primary_ys:
+                continue
 
-                    if desc_cont:
-                        if desc_cont.replace('.1', '') != current_row['voucher'].replace('.1', ''):
-                            current_row['desc'] = (current_row['desc'] + ' ' + desc_cont).strip()
-                    if vch_cont:
-                        current_row['voucher'] = (current_row['voucher'] + ' ' + vch_cont).strip()
+            # ── Pass 2: assign continuation lines to nearest primary via midpoint rule ──
+            for y in sorted(rows_by_y.keys()):
+                if y < 195 or y > 715:
+                    continue
+                if y in primary_data:
+                    continue  # already handled as a primary row
 
-    if current_row:
-        all_rows.append(current_row)
+                # Find nearest primary using midpoint rule
+                nearest_py = None
+                if y < primary_ys[0]:
+                    # Before first primary — belongs to the first primary
+                    nearest_py = primary_ys[0]
+                else:
+                    for i in range(len(primary_ys) - 1):
+                        mid = (primary_ys[i] + primary_ys[i + 1]) / 2
+                        if y <= mid:
+                            nearest_py = primary_ys[i]
+                            break
+                    if nearest_py is None:
+                        nearest_py = primary_ys[-1]
+
+                # Skip if too far from nearest primary (aging/summary section)
+                if abs(y - nearest_py) > 60:
+                    continue
+
+                ws_words = sorted(rows_by_y[y], key=lambda w: w['x0'])
+                desc_w, vch_w = [], []
+                for w in ws_words:
+                    x0, t = w['x0'], w['text']
+                    if FOLIO_MAX <= x0 < DESC_MAX:
+                        desc_w.append(t)
+                    elif DEP_MAX <= x0 < VCH_MAX:
+                        vch_w.append(t)
+
+                desc_cont = ' '.join(desc_w).strip()
+                vch_cont  = ' '.join(vch_w).strip()
+
+                # Skip repeated header rows
+                if desc_cont.lower() in HEADER_WORDS or vch_cont.lower() in HEADER_WORDS:
+                    continue
+
+                row = primary_data[nearest_py]
+                if desc_cont:
+                    row['desc'] = (row['desc'] + ' ' + desc_cont).strip()
+                if vch_cont:
+                    row['voucher'] = (row['voucher'] + ' ' + vch_cont).strip()
+
+            # Collect rows in top-to-bottom order
+            for y in primary_ys:
+                all_rows.append(primary_data[y])
+
     return all_rows
 
 def convert_statement(pdf_bytes, client_name, print_date):
@@ -412,14 +448,14 @@ def get_print_date(pdf_bytes):
 
 
 # ─── UI ─────────────────────────────────────────────────────────────
-st.markdown("## 📊 PDF → Excel")
+st.markdown("## 📊 PDF → Excel Converter")
 st.markdown("รองรับ 2 ประเภท: **งบทดลอง** และ **Statement of Account**")
 st.divider()
 
 uploaded = st.file_uploader(
     "อัปโหลดไฟล์ PDF",
     type=['pdf'],
-    help="รองรับ PDF ที่ไม่ใช่ภาพสแกน"
+    help="รองรับ PDF ที่สร้างจากโปรแกรมบัญชี (ไม่ใช่ภาพสแกน)"
 )
 
 if uploaded:
