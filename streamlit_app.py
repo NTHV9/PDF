@@ -317,7 +317,8 @@ def extract_statement_rows(pdf_bytes):
 
             # ── Pass 2: collect continuations with y positions ──
             # Use defaultdict keyed by nearest_py; each field stores [(y, text), ...]
-            cont = defaultdict(lambda: {'desc': [], 'voucher': []})
+            cont = defaultdict(lambda: {'desc': [], 'voucher': [],
+                                        'debit': [], 'credit': [], 'balance': []})
 
             for y in sorted(rows_by_y.keys()):
                 if y < 195 or y > 715:
@@ -344,25 +345,33 @@ def extract_statement_rows(pdf_bytes):
                     continue
 
                 ws_words = sorted(rows_by_y[y], key=lambda w: w['x0'])
-                desc_w, vch_w = [], []
+                desc_w, vch_w, debit_w, credit_w, bal_w = [], [], [], [], []
                 for w in ws_words:
-                    x0, t = w['x0'], w['text']
+                    x0, x1, t = w['x0'], w['x1'], w['text']
                     if FOLIO_MAX <= x0 < DESC_MAX:
                         desc_w.append(t)
                     elif DEP_MAX <= x0 < VCH_MAX:
                         vch_w.append(t)
+                    elif x0 >= VCH_MAX:
+                        if x1 <= DEBIT_X1_MAX:    debit_w.append(t)
+                        elif x1 <= CREDIT_X1_MAX: credit_w.append(t)
+                        else:                     bal_w.append(t)
 
-                desc_cont = ' '.join(desc_w).strip()
-                vch_cont  = ' '.join(vch_w).strip()
+                desc_cont   = ' '.join(desc_w).strip()
+                vch_cont    = ' '.join(vch_w).strip()
+                debit_cont  = ''.join(debit_w)
+                credit_cont = ''.join(credit_w)
+                bal_cont    = ''.join(bal_w)
 
                 # Skip repeated header rows
                 if desc_cont.lower() in HEADER_WORDS or vch_cont.lower() in HEADER_WORDS:
                     continue
 
-                if desc_cont:
-                    cont[nearest_py]['desc'].append((y, desc_cont))
-                if vch_cont:
-                    cont[nearest_py]['voucher'].append((y, vch_cont))
+                if desc_cont:   cont[nearest_py]['desc'].append((y, desc_cont))
+                if vch_cont:    cont[nearest_py]['voucher'].append((y, vch_cont))
+                if debit_cont:  cont[nearest_py]['debit'].append((y, debit_cont))
+                if credit_cont: cont[nearest_py]['credit'].append((y, credit_cont))
+                if bal_cont:    cont[nearest_py]['balance'].append((y, bal_cont))
 
             # ── Build final field values in correct y order ──
             for py in primary_ys:
@@ -378,6 +387,13 @@ def extract_statement_rows(pdf_bytes):
                 desc_all = sorted(cont[py]['desc'] + [(py, row['desc'])],
                                   key=lambda x: x[0])
                 row['desc'] = ' '.join(d for _, d in desc_all if d)
+
+                # Debit/Credit/Balance: sort by y, concatenate WITHOUT spaces
+                # (digits split across lines, e.g. "151,130.0" + "0" → "151,130.00")
+                for field in ('debit', 'credit', 'balance'):
+                    parts = sorted(cont[py][field] + [(py, row[field])],
+                                   key=lambda x: x[0])
+                    row[field] = ''.join(v for _, v in parts if v)
 
                 all_rows.append(row)
 
