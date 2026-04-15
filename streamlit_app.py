@@ -186,10 +186,50 @@ def detect_company_soa(pdf_bytes):
     except:
         return ''
 
+_SOA_HEADER_COLS = ['Date', 'Folio', 'Description', 'Arrival', 'Departure', 'Voucher', 'Debit', 'Credit', 'Balance']
+
+def _detect_soa_col_bounds(pdf_bytes):
+    """Detect column boundaries dynamically from the header row of the Statement PDF."""
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages[:2]:
+                words = page.extract_words()
+                rows_by_y = defaultdict(list)
+                for w in words:
+                    rows_by_y[round(w['top'] / 3) * 3].append(w)
+                for y in sorted(rows_by_y.keys()):
+                    row_words = rows_by_y[y]
+                    texts = [w['text'] for w in row_words]
+                    if 'Departure' in texts and 'Voucher' in texts:
+                        col = {w['text']: w['x0'] for w in row_words if w['text'] in _SOA_HEADER_COLS}
+                        if all(k in col for k in ['Date','Folio','Description','Arrival','Departure','Voucher','Debit']):
+                            def mid(a, b): return (col[a] + col[b]) / 2
+                            return dict(
+                                DATE_MAX      = mid('Date', 'Folio'),
+                                FOLIO_MAX     = mid('Folio', 'Description'),
+                                DESC_MAX      = mid('Description', 'Arrival'),
+                                ARR_MAX       = mid('Arrival', 'Departure'),
+                                DEP_MAX       = mid('Departure', 'Voucher'),
+                                VCH_MAX       = mid('Voucher', 'Debit'),
+                                DEBIT_X1_MAX  = col.get('Credit', col['Debit'] + 50),
+                                CREDIT_X1_MAX = col.get('Balance', col.get('Credit', col['Debit'] + 80) + 50),
+                            )
+    except:
+        pass
+    # Fallback (Batch-style layout)
+    return dict(DATE_MAX=74, FOLIO_MAX=133, DESC_MAX=218, ARR_MAX=298,
+                DEP_MAX=356, VCH_MAX=411, DEBIT_X1_MAX=490, CREDIT_X1_MAX=546)
+
 def extract_statement_rows(pdf_bytes):
-    DATE_MAX, FOLIO_MAX, DESC_MAX = 82, 131, 233
-    ARR_MAX, DEP_MAX, VCH_MAX = 278, 330, 420
-    DEBIT_X1_MAX, CREDIT_X1_MAX = 490, 540
+    b = _detect_soa_col_bounds(pdf_bytes)
+    DATE_MAX      = b['DATE_MAX']
+    FOLIO_MAX     = b['FOLIO_MAX']
+    DESC_MAX      = b['DESC_MAX']
+    ARR_MAX       = b['ARR_MAX']
+    DEP_MAX       = b['DEP_MAX']
+    VCH_MAX       = b['VCH_MAX']
+    DEBIT_X1_MAX  = b['DEBIT_X1_MAX']
+    CREDIT_X1_MAX = b['CREDIT_X1_MAX']
 
     all_rows = []
     current_row = None
@@ -372,14 +412,14 @@ def get_print_date(pdf_bytes):
 
 
 # ─── UI ─────────────────────────────────────────────────────────────
-st.markdown("## 📊 PDF → Excel Converter")
+st.markdown("## 📊 PDF → Excel")
 st.markdown("รองรับ 2 ประเภท: **งบทดลอง** และ **Statement of Account**")
 st.divider()
 
 uploaded = st.file_uploader(
     "อัปโหลดไฟล์ PDF",
     type=['pdf'],
-    help="รองรับ PDF ที่สร้างจากโปรแกรมบัญชี (ไม่ใช่ภาพสแกน)"
+    help="รองรับ PDF ที่ไม่ใช่ภาพสแกน"
 )
 
 if uploaded:
