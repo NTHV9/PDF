@@ -688,8 +688,18 @@ def extract_statement_rows(pdf_bytes):
             primary_ys   = []
             primary_data = {}
 
+            # Pre-scan footer boundary before Pass 1
+            footer_y = 715
             for y in sorted(rows_by_y.keys()):
-                if y < 195 or y > 715:
+                if y < 195:
+                    continue
+                rw_texts = [w['text'] for w in rows_by_y[y]]
+                if 'Balance' in rw_texts and 'Due' in rw_texts:
+                    footer_y = y - 1
+                    break
+
+            for y in sorted(rows_by_y.keys()):
+                if y < 195 or y > footer_y:
                     continue
                 ws_words = sorted(rows_by_y[y], key=lambda w: w['x0'])
                 date_w, folio_w, desc_w = [], [], []
@@ -730,7 +740,7 @@ def extract_statement_rows(pdf_bytes):
                                         'debit': [], 'credit': [], 'balance': []})
 
             for y in sorted(rows_by_y.keys()):
-                if y < 195 or y > 715:
+                if y < 195 or y > footer_y:
                     continue
                 if y in primary_data:
                     continue  # already handled as a primary row
