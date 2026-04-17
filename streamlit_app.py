@@ -688,13 +688,26 @@ def extract_statement_rows(pdf_bytes):
             primary_ys   = []
             primary_data = {}
 
-            # Pre-scan footer boundary before Pass 1
+            # Pre-scan footer boundary — stop before Aging/Balance-Due/Bank sections
             footer_y = 715
             for y in sorted(rows_by_y.keys()):
                 if y < 195:
                     continue
                 rw_texts = [w['text'] for w in rows_by_y[y]]
-                if 'Balance' in rw_texts and 'Due' in rw_texts:
+                is_footer = (
+                    # "Balance Due" on same line (Keytel format)
+                    ('Balance' in rw_texts and 'Due' in rw_texts) or
+                    # THB currency marker (appears on Balance Due amount line)
+                    '(THB)' in rw_texts or
+                    # Aging Summary section header
+                    'Aging' in rw_texts or
+                    # Bank Details section header
+                    ('Bank' in rw_texts and 'Details' in rw_texts) or
+                    # Standalone "Balance" split across lines (Luxury Escapes format)
+                    ('Balance' in rw_texts and len(rw_texts) <= 2 and
+                     not any(re.match(r'\d{2}/\d{2}/\d{2}', t) for t in rw_texts))
+                )
+                if is_footer:
                     footer_y = y - 1
                     break
 
