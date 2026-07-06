@@ -582,11 +582,13 @@ def detect_company_soa(pdf_bytes):
             text = pdf.pages[0].extract_text() or ''
             lines = [l.strip() for l in text.splitlines() if l.strip()]
             name_parts = []
+            _newvar = '[Folio No.' in text
             for l in lines[:6]:
                 if 'STATEMENT OF ACCOUNT' in l.upper(): continue
                 if 'A/R' in l or 'Account No' in l:
                     part = l.split('A/R')[0].strip()
                     if part: name_parts.append(part)
+                    if _newvar and part: break
                     continue
                 if 'Print Date' in l or 'Page No' in l: break
                 if len(l) < 40 and not any(kw in l for kw in ['Date', 'Folio', 'Debit', 'Credit']):
@@ -678,6 +680,11 @@ def extract_statement_rows(pdf_bytes):
     all_rows = []
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        # Newer letterhead template (Katathani style): folio lives inside the
+        # description as "[Folio No. :xxxx]", rows may lack a folio column and
+        # descriptions wrap over several lines below the row.
+        _first_text = pdf.pages[0].extract_text() or ''
+        new_variant = '[Folio No.' in _first_text
         for page in pdf.pages:
             words = page.extract_words()
             rows_by_y = defaultdict(list)
@@ -690,6 +697,10 @@ def extract_statement_rows(pdf_bytes):
 
             # Pre-scan footer boundary — stop before Aging/Balance-Due/Bank sections
             footer_y = 715
+            _date_ys = [y for y, ws_ in rows_by_y.items()
+                        for w in ws_
+                        if w['x0'] < DATE_MAX and re.match(r'^\d{2}/\d{2}/\d{2}$', w['text'])]
+            last_date_y = max(_date_ys) if _date_ys else 0
             for y in sorted(rows_by_y.keys()):
                 if y < 195:
                     continue
@@ -704,7 +715,10 @@ def extract_statement_rows(pdf_bytes):
                     # Bank Details section header
                     ('Bank' in rw_texts and 'Details' in rw_texts) or
                     # Standalone "Balance" split across lines (Luxury Escapes format)
+                    # — only after the last transaction row, so that wrapped
+                    #   "Old Balance" description text never truncates the table
                     ('Balance' in rw_texts and len(rw_texts) <= 2 and
+                     y > last_date_y and
                      not any(re.match(r'\d{2}/\d{2}/\d{2}', t) for t in rw_texts))
                 )
                 if is_footer:
@@ -734,7 +748,7 @@ def extract_statement_rows(pdf_bytes):
 
                 dv = ' '.join(date_w)
                 fv = ' '.join(folio_w)
-                if dv and fv and re.match(r'\d{2}/\d{2}/\d{2}', dv):
+                if dv and (fv or new_variant) and re.match(r'\d{2}/\d{2}/\d{2}', dv):
                     primary_ys.append(y)
                     primary_data[y] = {
                         'date': dv, 'folio': fv,
@@ -763,6 +777,10 @@ def extract_statement_rows(pdf_bytes):
                 if y < primary_ys[0]:
                     # Before first primary — belongs to the first primary
                     nearest_py = primary_ys[0]
+                elif new_variant:
+                    # descriptions wrap BELOW their row — attach to the
+                    # closest primary above this line
+                    nearest_py = max(py for py in primary_ys if py <= y)
                 else:
                     for i in range(len(primary_ys) - 1):
                         mid = (primary_ys[i] + primary_ys[i + 1]) / 2
@@ -796,7 +814,12 @@ def extract_statement_rows(pdf_bytes):
                 bal_cont    = ''.join(bal_w)
 
                 # Skip repeated header rows
-                if desc_cont.lower() in HEADER_WORDS or vch_cont.lower() in HEADER_WORDS:
+                if new_variant:
+                    _hdr_hits = sum(1 for t in (w['text'].lower() for w in ws_words)
+                                    if t in HEADER_WORDS)
+                    if _hdr_hits >= 3:
+                        continue
+                elif desc_cont.lower() in HEADER_WORDS or vch_cont.lower() in HEADER_WORDS:
                     continue
 
                 if desc_cont:   cont[nearest_py]['desc'].append((y, desc_cont))
@@ -819,6 +842,16 @@ def extract_statement_rows(pdf_bytes):
                 desc_all = sorted(cont[py]['desc'] + [(py, row['desc'])],
                                   key=lambda x: x[0])
                 row['desc'] = ' '.join(d for _, d in desc_all if d)
+
+                if new_variant and not row['folio']:
+                    _m = re.search(r'\[\s*Folio\s*No\.?\s*:?\s*(\d+)\s*\]',
+                                   (row['arrival'] + ' ' + row['departure'] + ' ' +
+                                    row['voucher']))
+                    if _m:
+                        row['folio'] = _m.group(1)
+                        for _f in ('arrival', 'departure', 'voucher'):
+                            row[_f] = re.sub(r'\[?\s*Folio\s*No\.?\s*:?\s*\d*\s*\]?',
+                                             '', row[_f]).strip()
 
                 # Debit/Credit/Balance: sort by y, concatenate WITHOUT spaces
                 # (digits split across lines, e.g. "151,130.0" + "0" → "151,130.00")
@@ -2097,8 +2130,12 @@ def detect_aging_type(pdf_bytes, progress_cb=None):
         return None
     if not _ag_is_garbled(text0):
         up = text0.upper()
+        # reports of other types may contain a small aging table (e.g. a
+        # Statement of Account footer) — those types take priority
+        if 'STATEMENT OF ACCOUNT' in up or 'MATRIX TRIAL BALANCE' in up:
+            return None
         if 'AR DETAILED AGING' in up: return 'ar_detailed_aging'
-        if 'AGING SUMMARY' in up: return 'aging_summary'
+        if 'AGING SUMMARY FOR' in up: return 'aging_summary'
         return None
     if not AGING_RASTER_OK:
         return None
