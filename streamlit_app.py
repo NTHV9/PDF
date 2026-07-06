@@ -1416,6 +1416,14 @@ def parse_aging_summary(pdf_bytes):
                 items.append({'kind': 'section', 'label': 'Accruals'})
             elif re.match(r'^A/?RLEDGER$', glue) and not has_nums:
                 items.append({'kind': 'section', 'label': 'A/R Ledger'})
+            elif has_nums and not name_txt and not accno_w and items and \
+                    items[-1]['kind'] in ('type_total', 'ledger_total',
+                                          'accruals_total', 'grand_total', 'pct') and \
+                    all(v is None for v in items[-1]['vals']):
+                items[-1]['vals'] = bucket_vals
+                if items[-1]['kind'] in ('pct', 'ledger_total') and -1 in vals:
+                    d = re.sub(r'\D', '', vals[-1])
+                    if d: items[-1]['count'] = int(d)
             elif has_nums:
                 accno = ''
                 if accno_w:
@@ -1542,6 +1550,7 @@ def parse_ar_detailed(pdf_bytes):
     cur_account = None      # {'name','accno','rows':[],'total':None}
     cur_section = None
     last_kind = None
+    pending_total = None    # 'account'|'ledger'|'accruals'|'grand' — label seen, numbers pending
 
     def close_account():
         nonlocal cur_account
@@ -1550,7 +1559,7 @@ def parse_ar_detailed(pdf_bytes):
             cur_account = None
 
     for pi, chars in enumerate(pages):
-        lines = _ag_lines(chars, tol=2.8)
+        lines = _ag_lines(chars, tol=4.0)
         # header line (Guest Name Invoice No. ... Total)
         hdr_i = None; zones = None
         for li, line in enumerate(lines):
@@ -1644,14 +1653,20 @@ def parse_ar_detailed(pdf_bytes):
                     items.append({'kind': 'section', 'label': 'Accruals'})
                 last_kind = 'section'; continue
             if re.match(r'^TOTALA/?RLEDGER$', glue):
+                if not has_nums:
+                    pending_total = 'ledger'; last_kind = 'total_label'; continue
                 close_account()
                 items.append({'kind': 'ledger_total', 'vals': bucket_vals})
                 last_kind = 'ledger_total'; continue
             if re.match(r'^TOTALACCR[UO]A[LI]S$', glue):
+                if not has_nums:
+                    pending_total = 'accruals'; last_kind = 'total_label'; continue
                 close_account()
                 items.append({'kind': 'accruals_total', 'vals': bucket_vals})
                 last_kind = 'accruals_total'; continue
             if glue == 'GRANDTOTAL':
+                if not has_nums:
+                    pending_total = 'grand'; last_kind = 'total_label'; continue
                 close_account()
                 items.append({'kind': 'grand_total', 'vals': bucket_vals})
                 last_kind = 'grand_total'; continue
@@ -1660,7 +1675,24 @@ def parse_ar_detailed(pdf_bytes):
                     cur_account['total'] = bucket_vals
                     close_account()
                 last_kind = 'account_total'; continue
+            if glue == 'TOTAL' and not has_nums:
+                pending_total = 'account'; last_kind = 'total_label'; continue
+            # numbers-only line completing a split total label
+            if has_nums and pending_total and not name_txt and not inv_txt \
+               and not date_txt:
+                if pending_total == 'account':
+                    if cur_account is not None:
+                        cur_account['total'] = bucket_vals
+                        close_account()
+                    last_kind = 'account_total'
+                else:
+                    close_account()
+                    items.append({'kind': pending_total + '_total', 'vals': bucket_vals})
+                    last_kind = pending_total + '_total'
+                pending_total = None
+                continue
             if has_nums:
+                pending_total = None
                 if cur_account is None:
                     cur_account = {'kind': 'account', 'name': '(unknown)', 'accno': '',
                                    'section': cur_section, 'rows': [], 'total': None}
